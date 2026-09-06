@@ -1,0 +1,31 @@
+# ---- secrets / environment ----
+.env
+.env.*
+!.env.example
+
+# ---- python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# ---- node / next.js (web/) ----
+node_modules/
+.next/
+out/
+build/
+*.tsbuildinfo
+next-env.d.ts
+
+# ---- vercel ----
+.vercel/
+
+# ---- bundled local node toolchain ----
+.local-tools/
+
+# ---- editor / OS ----
+.DS_Store
+.claude/
+*.pem

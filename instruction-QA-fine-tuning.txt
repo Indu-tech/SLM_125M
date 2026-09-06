@@ -1,0 +1,8 @@
+Now I want to SFT my modal with QA pairs. 
+
+Please perform the below steps 1 at a time and take a confirmation after each step:
+1. Please plan SFT + QA pairs. How many QA pairs will be ideal for 125M model
+2. Which dataset will be used for the QA pair
+3. Use OpenAI gpt-5.4-nano model for the QA pairs. The OpenAI token is present in the .env.local file. Mention the cost it wlll take to generate QA pairs
+4. WHere will the QA pairs be stored
+5. Confirm with me the before moving to nex step

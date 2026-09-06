@@ -1,0 +1,7 @@
+Now I want to run RAFT on top of the QA SFT model:
+
+Please perform the below steps 1 at a time and take a confirmation after each step:
+1. Please plan RAFT. Suggest the dataset mixutre that should be used here
+2. After RAFT, I would like to add RAG further
+3. What will be the time and cost for implementing RAFT + RAG
+4. I want a new front-end in vercel which will have a RAG playgroud with some examples to run/ ask
