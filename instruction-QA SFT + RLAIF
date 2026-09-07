@@ -1,6 +1,10 @@
 Now I want to run RLAIF on top of QA SFT. Please read the below steps and confirm with me before running anything
 
 Step 1: What is needed to further fine tune the 125M QA tuned model using RLAIF technique
-Step 2: Can we use a cheap OpenAI model for the feedback
+Step 2: Can we use a cheap OpenAI model for the reward model
 Step 3: How much time and cost it will take to use RLAIF
-S
+Step 4: How can we get the <prompt, good_response, bad_response> pairs and which model can give that
+Step 5: Provide a plan to fine-tune the QA fine-tuned model with RLAIF
+
+
+Do not implement any step only provide the time and cost for fine tuning RHAIF

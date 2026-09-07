@@ -1521,6 +1521,735 @@ def deploy_raft(private: bool = True):
     print(f"done: {r}")
 
 
+# ---- Phases 14-17: DPO / RLAIF -- preference-tune the SFT checkpoint on AI-labelled pairs.
+# Continues from checkpoints/sft into checkpoints/dpo; SFT + RAFT weights are never opened
+# for writing. base -> SFT -> {RAFT, DPO}. Whole pipeline budgeted at <=30 min wall-clock.
+# See DPO-plan.md. ----
+rlaif_eval_image = (
+    modal.Image.debian_slim(python_version="3.12")
+    .pip_install("torch==2.5.1", "transformers==4.46.3", "numpy==1.26.4", "openai==1.59.6")
+    .add_local_python_source("config")
+)
+
+
+def _count_domains(recs: list) -> dict:
+    c: dict[str, int] = {}
+    for r in recs:
+        c[r["domain"]] = c.get(r["domain"], 0) + 1
+    return c
+
+
+def _rlaif_qa_records() -> list[dict]:
+    """The 1,196 SFT QA pairs, verbatim, as {prompt, response, domain}."""
+    import glob
+    import json
+
+    recs: list[dict] = []
+    for path in sorted(glob.glob(f"{config.SFT_RAW_DIR}/*.jsonl")):
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                rec = json.loads(line)
+                recs.append({"prompt": rec["prompt"], "response": rec["response"],
+                             "domain": rec.get("domain", "unknown")})
+    return recs
+
+
+def _rlaif_domain_chunk_pools() -> dict:
+    """domain -> [chunk, ...], rebuilt from the exact excerpts QA generation drew from
+    (deterministic _sample_excerpts replay -- identical to raft_prepare_data)."""
+    pools: dict[str, list[str]] = {}
+    for src in config.QA_MIX:
+        n_calls = -(-src.num_pairs // src.pairs_per_call)
+        excerpts = _sample_excerpts(src.corpus_subdir, n_calls, config.QA_EXCERPT_CHARS)
+        pool: list[str] = []
+        for ex in excerpts:
+            pool.extend(_chunk_text(ex, config.RAFT_CHUNK_CHARS, config.RAFT_CHUNK_MIN_CHARS))
+        pools[src.name] = pool
+    return pools
+
+
+def _rlaif_ground(records: list, pools: dict) -> None:
+    """Attach rec['excerpt'] = the best-matching chunk for rec['response'] (per-domain
+    IDF-weighted word overlap, same scoring as raft_prepare_data)."""
+    import math
+
+    for domain in {r["domain"] for r in records}:
+        pool = pools.get(domain, [])
+        if not pool:
+            for r in records:
+                if r["domain"] == domain:
+                    r["excerpt"] = ""
+            continue
+        pool_wc = [_word_counts(c) for c in pool]
+        df: dict[str, int] = {}
+        for wc in pool_wc:
+            for w in wc:
+                df[w] = df.get(w, 0) + 1
+        n_pool = len(pool_wc)
+        idf = {w: math.log(1 + n_pool / d) for w, d in df.items()}
+        for r in records:
+            if r["domain"] != domain:
+                continue
+            rw = set(_word_counts(r["response"]))
+            scores = [sum(idf.get(w, 0.0) for w in (rw & set(wc))) for wc in pool_wc]
+            r["excerpt"] = pool[max(range(len(pool)), key=lambda i: scores[i])]
+
+
+def _rlaif_split(records: list) -> None:
+    """Deterministic, domain-stratified held-out split; sets rec['split'] and rec['id']."""
+    import random
+
+    rng = random.Random(config.DPO.seed)
+    by_dom: dict[str, list[int]] = {}
+    for i, r in enumerate(records):
+        by_dom.setdefault(r["domain"], []).append(i)
+    total = len(records)
+    heldout: set[int] = set()
+    for idxs in by_dom.values():
+        k = round(config.RLAIF_HELDOUT_N * len(idxs) / max(total, 1))
+        heldout.update(rng.sample(idxs, min(k, len(idxs))))
+    for i, r in enumerate(records):
+        r["id"] = i
+        r["split"] = "heldout" if i in heldout else "train"
+
+
+def _rlaif_perturb(answer: str, kind: str, foreign: str) -> str:
+    """A deliberately worse version of a grounded answer, for Track-B preference pairs."""
+    import re
+
+    toks = answer.split()
+    if kind == "truncate" and len(toks) >= 6:
+        return " ".join(toks[: max(3, int(len(toks) * 0.55))]).rstrip(".,;:") + "."
+    if kind == "unsupported" and foreign:
+        return answer.rstrip() + " " + foreign
+    if kind == "entity":
+        m = re.search(r"\b(19|20)\d{2}\b", answer)
+        if m:
+            return answer[: m.start()] + str(int(m.group()) + 7) + answer[m.end():]
+        m = re.search(r"\b\d[\d,]*(?:\.\d+)?\b", answer)
+        if m:
+            return answer[: m.start()] + "roughly double that" + answer[m.end():]
+    return " ".join(toks[: max(3, len(toks) // 2)]).rstrip(".,;:") + "."
+
+
+def _rlaif_generate(model, tok, user_prompts: list, device, *, n: int, temp: float,
+                    top_p: float, max_new_tokens: int) -> list:
+    """Left-padded batched sampling. Returns [[str]*n, ...] aligned with user_prompts."""
+    import torch
+
+    user_id = tok.convert_tokens_to_ids("<|user|>")
+    asst_id = tok.convert_tokens_to_ids("<|assistant|>")
+    eos_id = tok.convert_tokens_to_ids(config.SPECIAL_TOKENS["eos_token"])
+    pad_id = tok.pad_token_id
+    prompt_cap = config.SEQ_LEN - max_new_tokens - 40
+    out: list = [[] for _ in user_prompts]
+    B = config.RLAIF_GEN_BATCH
+    for s in range(0, len(user_prompts), B):
+        chunk = user_prompts[s:s + B]
+        seqs = [[user_id] + tok(p, add_special_tokens=False)["input_ids"][:prompt_cap] + [asst_id]
+                for p in chunk]
+        maxlen = max(len(x) for x in seqs)
+        ids = torch.full((len(seqs), maxlen), pad_id, dtype=torch.long)
+        attn = torch.zeros((len(seqs), maxlen), dtype=torch.long)
+        for i, x in enumerate(seqs):
+            ids[i, maxlen - len(x):] = torch.tensor(x, dtype=torch.long)
+            attn[i, maxlen - len(x):] = 1
+        with torch.no_grad():
+            gen = model.generate(
+                input_ids=ids.to(device), attention_mask=attn.to(device),
+                do_sample=True, temperature=temp, top_p=top_p, num_return_sequences=n,
+                max_new_tokens=max_new_tokens, pad_token_id=pad_id, eos_token_id=eos_id)
+        gen = gen[:, maxlen:]
+        for i in range(len(seqs)):
+            for j in range(n):
+                out[s + i].append(tok.decode(gen[i * n + j], skip_special_tokens=True).strip())
+    return out
+
+
+# ---- Phase 14: prep -- held-out split, on-policy candidates, Track-B perturbation pairs ----
+@app.function(image=gpu_image, gpu=config.DPO_GPU, volumes=VOLUMES, timeout=60 * 20)
+def prep_rlaif_data() -> dict:
+    import json
+    import os
+    import random
+
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    records = _rlaif_qa_records()
+    _rlaif_ground(records, _rlaif_domain_chunk_pools())
+    _rlaif_split(records)
+
+    os.makedirs(config.RLAIF_RAW_DIR, exist_ok=True)
+    with open(config.RLAIF_PROMPTS_PATH, "w", encoding="utf-8") as fh:
+        for r in records:
+            fh.write(json.dumps(r) + "\n")
+
+    train = [r for r in records if r["split"] == "train"]
+    heldout = [r for r in records if r["split"] == "heldout"]
+
+    device = torch.device("cuda")
+    tok = AutoTokenizer.from_pretrained(config.TOKENIZER_DIR)
+    tok.padding_side = "left"
+    model = AutoModelForCausalLM.from_pretrained(config.SFT_CKPT_DIR)
+    model = model.to(device=device, dtype=torch.bfloat16)
+    model.eval()
+
+    samples = _rlaif_generate(
+        model, tok, [r["prompt"] for r in train], device,
+        n=config.RLAIF_SAMPLES_PER_PROMPT, temp=config.RLAIF_SAMPLE_TEMP,
+        top_p=config.RLAIF_SAMPLE_TOP_P, max_new_tokens=config.RLAIF_SAMPLE_MAX_NEW_TOKENS)
+
+    with open(config.RLAIF_CANDIDATES_PATH, "w", encoding="utf-8") as fh:
+        for r, s in zip(train, samples):
+            fh.write(json.dumps({"id": r["id"], "domain": r["domain"], "prompt": r["prompt"],
+                                 "excerpt": r["excerpt"], "samples": s}) + "\n")
+
+    # Track B: deterministic perturbation pairs. chosen = the grounded gold answer,
+    # rejected = a corruption of it (truncated / unsupported-sentence / wrong-entity).
+    rng = random.Random(config.DPO.seed)
+    kinds = ["truncate", "unsupported", "entity"]
+    dom_sents: dict[str, list[str]] = {}
+    for r in records:
+        for sent in r["response"].replace("\n", " ").split(". "):
+            sent = sent.strip()
+            if len(sent) > 25:
+                dom_sents.setdefault(r["domain"], []).append(sent.rstrip(".") + ".")
+    foreign_pool = {d: [x for dd, ss in dom_sents.items() if dd != d for x in ss] for d in dom_sents}
+
+    tb = 0
+    with open(config.RLAIF_PAIRS_TRACKB_PATH, "w", encoding="utf-8") as fh:
+        for i, r in enumerate(train):
+            kind = kinds[i % len(kinds)]
+            pool = foreign_pool.get(r["domain"]) or [""]
+            bad = _rlaif_perturb(r["response"], kind, rng.choice(pool))
+            if bad.strip() and bad.strip() != r["response"].strip():
+                fh.write(json.dumps({"prompt": r["prompt"], "chosen": r["response"],
+                                     "rejected": bad, "domain": r["domain"], "track": "B",
+                                     "kind": kind, "excerpt": r["excerpt"]}) + "\n")
+                tb += 1
+
+    volume.commit()
+    summary = {"records": len(records), "train": len(train), "heldout": len(heldout),
+               "heldout_by_domain": _count_domains(heldout),
+               "candidate_prompts": len(samples), "samples_each": config.RLAIF_SAMPLES_PER_PROMPT,
+               "track_b_pairs": tb}
+    print(f"rlaif prep: {summary}")
+    return summary
+
+
+@app.local_entrypoint()
+def rlaif_prep():
+    r = prep_rlaif_data.remote()
+    print(f"done: {r}")
+
+
+# ---- Phase 15: AI preference labelling -- sharded across RLAIF_JUDGE_SHARDS containers ----
+@app.function(image=openai_image, volumes=VOLUMES,
+              secrets=[modal.Secret.from_name(config.OPENAI_SECRET_NAME)], timeout=60 * 45)
+def rlaif_judge_shard(shard_index: int, num_shards: int) -> list:
+    import json
+    import os
+    import random
+    import time
+
+    from openai import OpenAI
+
+    client = OpenAI(api_key=os.environ["OPENAI_API_KEY"],
+                    max_retries=config.RLAIF_JUDGE_MAX_RETRIES, timeout=60.0)
+    rows: list[dict] = []
+    with open(config.RLAIF_CANDIDATES_PATH, encoding="utf-8") as fh:
+        for i, line in enumerate(fh):
+            if i % num_shards == shard_index:
+                rows.append(json.loads(line))
+
+    def _letter_idx(v, letters) -> int:
+        s = str(v).strip().upper()
+        for k, L in enumerate(letters):
+            if L in s:
+                return k
+        return -1
+
+    def judge(excerpt, question, answers, order):
+        letters = [chr(65 + k) for k in range(len(answers))]
+        shown = "\n".join(f"[{letters[k]}] {answers[order[k]]}" for k in range(len(answers)))
+        user = f"Excerpt:\n{excerpt}\n\nQuestion: {question}\n\nCandidate answers:\n{shown}"
+        resp = client.chat.completions.create(
+            model=config.PREF_JUDGE_MODEL, response_format={"type": "json_object"},
+            messages=[{"role": "system", "content": config.RLAIF_JUDGE_SYSTEM_PROMPT},
+                      {"role": "user", "content": user}])
+        p = json.loads(resp.choices[0].message.content)
+        bi, wi = _letter_idx(p.get("best"), letters), _letter_idx(p.get("worst"), letters)
+        if bi < 0 or wi < 0:
+            raise ValueError(f"unparseable verdict: {p}")
+        return order[bi], order[wi], float(p.get("confidence", 0.0))
+
+    out: list[dict] = []
+    n_err = 0
+    for rec in rows:
+        answers = [a for a in rec["samples"] if a.strip()]
+        if len(answers) < 2:
+            continue
+        n = len(answers)
+        o1 = list(range(n))
+        random.Random(rec["id"]).shuffle(o1)
+        o2 = list(range(n))
+        random.Random(rec["id"] + 99_991).shuffle(o2)
+        try:
+            b1, w1, c1 = judge(rec["excerpt"], rec["prompt"], answers, o1)
+            time.sleep(config.RLAIF_JUDGE_SLEEP)
+            b2, w2, c2 = judge(rec["excerpt"], rec["prompt"], answers, o2)
+            time.sleep(config.RLAIF_JUDGE_SLEEP)
+        except Exception as e:
+            n_err += 1
+            if n_err <= 3:
+                print(f"[judge {shard_index}] id={rec['id']} failed: {e}")
+            continue
+        if b1 == b2 and w1 == w2 and b1 != w1 and min(c1, c2) >= config.RLAIF_JUDGE_MIN_CONF:
+            out.append({"prompt": rec["prompt"], "chosen": answers[b1], "rejected": answers[w1],
+                        "domain": rec["domain"], "track": "A",
+                        "judge_conf": round(min(c1, c2), 3), "excerpt": rec["excerpt"]})
+    print(f"[judge {shard_index}/{num_shards}] {len(rows)} prompts -> {len(out)} kept pairs "
+          f"({n_err} calls errored)")
+    return out
+
+
+@app.function(image=cpu_image, volumes=VOLUMES, timeout=60 * 10)
+def rlaif_collect_pairs(track_a_lists: list) -> dict:
+    import json
+    import random
+
+    track_a = [p for sub in track_a_lists for p in (sub or [])]
+    track_b: list[dict] = []
+    with open(config.RLAIF_PAIRS_TRACKB_PATH, encoding="utf-8") as fh:
+        for line in fh:
+            track_b.append(json.loads(line))
+
+    rng = random.Random(config.DPO.seed)
+    rng.shuffle(track_a)
+    rng.shuffle(track_b)
+    target = config.RLAIF_TARGET_PAIRS
+    n_b = min(len(track_b), round(target * config.RLAIF_TRACK_B_FRAC))
+    n_a = min(len(track_a), target - n_b)
+    n_b = min(len(track_b), target - n_a)  # backfill from B if A came up short
+    pairs = track_a[:n_a] + track_b[:n_b]
+    rng.shuffle(pairs)
+
+    domain_counts: dict[str, int] = {}
+    track_counts: dict[str, int] = {}
+    with open(config.RLAIF_PAIRS_PATH, "w", encoding="utf-8") as fh:
+        for p in pairs:
+            fh.write(json.dumps(p) + "\n")
+            domain_counts[p["domain"]] = domain_counts.get(p["domain"], 0) + 1
+            track_counts[p["track"]] = track_counts.get(p["track"], 0) + 1
+    volume.commit()
+    summary = {"total_pairs": len(pairs), "track_a_available": len(track_a),
+               "track_b_available": len(track_b), "track_counts": track_counts,
+               "domain_counts": domain_counts}
+    print(f"rlaif collect pairs: {summary}")
+    return summary
+
+
+@app.local_entrypoint()
+def rlaif_judge():
+    shards = [(i, config.RLAIF_JUDGE_SHARDS) for i in range(config.RLAIF_JUDGE_SHARDS)]
+    print(f"Launching {len(shards)} judge shards ({config.PREF_JUDGE_MODEL})...")
+    results = list(rlaif_judge_shard.starmap(shards))
+    r = rlaif_collect_pairs.remote(results)
+    print(f"done: {r}")
+
+
+# Rebuild pairs.jsonl from the on-disk sources without re-judging -- used to re-mix the
+# Track-A / Track-B ratio (via RLAIF_TRACK_B_FRAC / RLAIF_TARGET_PAIRS) after inspection.
+@app.function(image=cpu_image, volumes=VOLUMES, timeout=60 * 5)
+def rebuild_rlaif_pairs(track_b_only: bool = False) -> dict:
+    import json
+    import os
+    import random
+
+    track_b = [json.loads(x) for x in open(config.RLAIF_PAIRS_TRACKB_PATH, encoding="utf-8")]
+    track_a: list[dict] = []
+    if not track_b_only and os.path.exists(config.RLAIF_PAIRS_PATH):
+        track_a = [r for r in (json.loads(x) for x in open(config.RLAIF_PAIRS_PATH, encoding="utf-8"))
+                   if r.get("track") == "A"]
+
+    rng = random.Random(config.DPO.seed)
+    rng.shuffle(track_a)
+    rng.shuffle(track_b)
+    target = config.RLAIF_TARGET_PAIRS
+    n_a = 0 if track_b_only else min(len(track_a), target - round(target * config.RLAIF_TRACK_B_FRAC))
+    pairs = track_a[:n_a] + track_b[:target - n_a]
+    rng.shuffle(pairs)
+
+    domain_counts: dict[str, int] = {}
+    track_counts: dict[str, int] = {}
+    with open(config.RLAIF_PAIRS_PATH, "w", encoding="utf-8") as fh:
+        for p in pairs:
+            fh.write(json.dumps(p) + "\n")
+            domain_counts[p["domain"]] = domain_counts.get(p["domain"], 0) + 1
+            track_counts[p["track"]] = track_counts.get(p["track"], 0) + 1
+    volume.commit()
+    out = {"total_pairs": len(pairs), "track_counts": track_counts, "domain_counts": domain_counts,
+           "track_a_on_disk": len(track_a), "track_b_on_disk": len(track_b)}
+    print(f"rebuild pairs: {out}")
+    return out
+
+
+@app.local_entrypoint()
+def rlaif_rebuild_pairs(track_b_only: bool = False):
+    r = rebuild_rlaif_pairs.remote(track_b_only)
+    print(f"done: {r}")
+
+
+# ---- Phase 15.5: tokenize preference pairs (mirrors tokenize_sft, doubled for chosen/rejected) ----
+@app.function(image=ml_image, volumes=VOLUMES, timeout=60 * 10, cpu=4.0, memory=8_192)
+def tokenize_rlaif() -> dict:
+    import json
+    import os
+
+    import numpy as np
+    from transformers import AutoTokenizer
+
+    tok = AutoTokenizer.from_pretrained(config.TOKENIZER_DIR)
+    user_id = tok.convert_tokens_to_ids("<|user|>")
+    asst_id = tok.convert_tokens_to_ids("<|assistant|>")
+    eos_id = tok.convert_tokens_to_ids(config.SPECIAL_TOKENS["eos_token"])
+    pad_id = tok.pad_token_id
+    seq_len = config.SEQ_LEN
+
+    def encode(prompt: str, answer: str):
+        q = tok(prompt, add_special_tokens=False)["input_ids"]
+        a = tok(answer, add_special_tokens=False)["input_ids"]
+        ids = [user_id] + q + [asst_id] + a + [eos_id]
+        if len(ids) > seq_len:
+            return None
+        mask = [0] * (2 + len(q)) + [1] * (len(a) + 1)
+        pad = seq_len - len(ids)
+        return (np.asarray(ids + [pad_id] * pad, dtype=np.uint16),
+                np.asarray(mask + [0] * pad, dtype=np.uint8))
+
+    os.makedirs(config.RLAIF_TOKENS_DIR, exist_ok=True)
+    c_ids, c_mask, r_ids, r_mask = [], [], [], []
+    domain_counts: dict[str, int] = {}
+    track_counts: dict[str, int] = {}
+    dropped = 0
+    with open(config.RLAIF_PAIRS_PATH, encoding="utf-8") as fh:
+        for line in fh:
+            rec = json.loads(line)
+            ce, re_ = encode(rec["prompt"], rec["chosen"]), encode(rec["prompt"], rec["rejected"])
+            if ce is None or re_ is None:
+                dropped += 1
+                continue
+            c_ids.append(ce[0])
+            c_mask.append(ce[1])
+            r_ids.append(re_[0])
+            r_mask.append(re_[1])
+            d, t = rec.get("domain", "unknown"), rec.get("track", "?")
+            domain_counts[d] = domain_counts.get(d, 0) + 1
+            track_counts[t] = track_counts.get(t, 0) + 1
+
+    np.stack(c_ids).tofile(f"{config.RLAIF_TOKENS_DIR}/chosen_input_ids.bin")
+    np.stack(c_mask).tofile(f"{config.RLAIF_TOKENS_DIR}/chosen_loss_mask.bin")
+    np.stack(r_ids).tofile(f"{config.RLAIF_TOKENS_DIR}/rejected_input_ids.bin")
+    np.stack(r_mask).tofile(f"{config.RLAIF_TOKENS_DIR}/rejected_loss_mask.bin")
+
+    index = {"seq_len": seq_len, "dtype": "uint16", "mask_dtype": "uint8",
+             "num_pairs": len(c_ids), "dropped_too_long": dropped,
+             "domain_counts": domain_counts, "track_counts": track_counts}
+    with open(config.RLAIF_INDEX_PATH, "w", encoding="utf-8") as fh:
+        json.dump(index, fh, indent=2)
+    volume.commit()
+    print(f"RLAIF tokenize: {len(c_ids)} pairs packed, {dropped} dropped (too long)")
+    return index
+
+
+@app.local_entrypoint()
+def rlaif_tokenize():
+    r = tokenize_rlaif.remote()
+    print(f"done: {r}")
+
+
+# ---- Phase 16: DPO training -- continues from the SFT checkpoint, writes checkpoints/dpo.
+# checkpoints/sft is never opened for writing. Cooperative time cap + resumable, like sft_train. ----
+@app.function(image=gpu_image, gpu=config.DPO_GPU, volumes=VOLUMES, timeout=config.DPO_TIMEOUT)
+def dpo_train(epochs: int = config.DPO.epochs,
+              max_seconds: int = config.DPO_MAX_SECONDS) -> dict:
+    import json
+    import os
+    import time
+
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
+    import numpy as np
+    import torch
+    import torch.nn.functional as F
+    from transformers import AutoModelForCausalLM
+
+    device = torch.device("cuda")
+    with open(config.RLAIF_INDEX_PATH, encoding="utf-8") as fh:
+        idx = json.load(fh)
+    n = idx["num_pairs"]
+    seq_len = config.SEQ_LEN
+    d = config.RLAIF_TOKENS_DIR
+
+    def mm(name, dtype):
+        return np.memmap(f"{d}/{name}", dtype=dtype, mode="r").reshape(n, seq_len)
+
+    c_ids, c_mask = mm("chosen_input_ids.bin", np.uint16), mm("chosen_loss_mask.bin", np.uint8)
+    r_ids, r_mask = mm("rejected_input_ids.bin", np.uint16), mm("rejected_loss_mask.bin", np.uint8)
+
+    policy = AutoModelForCausalLM.from_pretrained(config.SFT_CKPT_DIR).to(device, torch.bfloat16)
+    ref = AutoModelForCausalLM.from_pretrained(config.SFT_CKPT_DIR).to(device, torch.bfloat16)
+    ref.eval()
+    for p in ref.parameters():
+        p.requires_grad_(False)
+    policy.train()
+    policy.config.use_cache = False
+    policy.gradient_checkpointing_enable(  # trade compute for memory -- L4 is tight
+        gradient_checkpointing_kwargs={"use_reentrant": False})
+
+    opt = torch.optim.AdamW(policy.parameters(), lr=config.DPO.lr,
+                            weight_decay=config.DPO.weight_decay)
+
+    micro_bs = config.DPO.micro_batch_size
+    steps_per_epoch = max(1, n // micro_bs)
+    total_steps = steps_per_epoch * epochs
+    beta, lam = config.DPO.beta, config.DPO.nll_weight
+
+    def lr_at(step: int) -> float:
+        if step < config.DPO.warmup_steps:
+            return config.DPO.lr * (step + 1) / config.DPO.warmup_steps
+        return config.DPO.lr
+
+    def seq_logp(model, ids, mask):
+        # per-token logprob without materialising a full (B,T,V) softmax (TRL-style).
+        # chosen and rejected are scored in separate forwards to halve the peak logits tensor.
+        out = []
+        tok = []
+        for half_ids, half_m in ((ids[:micro_bs], mask[:micro_bs]),
+                                 (ids[micro_bs:], mask[micro_bs:])):
+            logits = model(input_ids=half_ids, use_cache=False).logits[:, :-1, :].float()
+            lp = (torch.gather(logits, -1, half_ids[:, 1:, None]).squeeze(-1)
+                  - torch.logsumexp(logits, dim=-1))
+            del logits
+            m = half_m[:, 1:]
+            out.append((lp * m).sum(-1))
+            tok.append(m.sum(-1))
+        return torch.cat(out), torch.cat(tok)
+
+    rng = np.random.default_rng(config.DPO.seed)
+    order = np.arange(n)
+    start = time.time()
+    step = 0
+    stop = False
+    for _epoch in range(epochs):
+        rng.shuffle(order)
+        for b in range(steps_per_epoch):
+            if time.time() - start > max_seconds:
+                stop = True
+                break
+            bi = order[b * micro_bs:(b + 1) * micro_bs]
+            cj = torch.from_numpy(c_ids[bi].astype(np.int64)).to(device)
+            rj = torch.from_numpy(r_ids[bi].astype(np.int64)).to(device)
+            cm = torch.from_numpy(c_mask[bi].astype(np.float32)).to(device)
+            rm = torch.from_numpy(r_mask[bi].astype(np.float32)).to(device)
+            ids = torch.cat([cj, rj])
+            msk = torch.cat([cm, rm])
+
+            for g in opt.param_groups:
+                g["lr"] = lr_at(step)
+            opt.zero_grad(set_to_none=True)
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                pol, pol_tok = seq_logp(policy, ids, msk)
+                with torch.no_grad():
+                    rf, _ = seq_logp(ref, ids, msk)
+            pol_c, pol_r = pol.chunk(2)
+            rf_c, rf_r = rf.chunk(2)
+            ntok_c = pol_tok.chunk(2)[0].clamp(min=1)
+            logits_dpo = (pol_c - rf_c) - (pol_r - rf_r)
+            loss_dpo = -F.logsigmoid(beta * logits_dpo).mean()
+            loss_nll = -(pol_c / ntok_c).mean()
+            loss = loss_dpo + lam * loss_nll
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(policy.parameters(), config.DPO.grad_clip)
+            opt.step()
+            step += 1
+
+            if step % config.DPO.log_every_steps == 0:
+                with torch.no_grad():
+                    rw, rl = beta * (pol_c - rf_c), beta * (pol_r - rf_r)
+                    acc = (rw > rl).float().mean().item()
+                    margin = (rw - rl).mean().item()
+                    clen, rlen = cm[:, 1:].sum(-1).mean().item(), rm[:, 1:].sum(-1).mean().item()
+                print(f"step {step}/{total_steps} loss={loss.item():.4f} "
+                      f"dpo={loss_dpo.item():.4f} nll={loss_nll.item():.4f} acc={acc:.3f} "
+                      f"margin={margin:+.3f} len(c/r)={clen:.0f}/{rlen:.0f} "
+                      f"lr={opt.param_groups[0]['lr']:.2e} elapsed={time.time()-start:.0f}s")
+            if step % config.DPO.ckpt_every_steps == 0:
+                os.makedirs(config.RLAIF_CKPT_DIR, exist_ok=True)
+                policy.save_pretrained(config.RLAIF_CKPT_DIR)
+                volume.commit()
+        if stop:
+            break
+
+    os.makedirs(config.RLAIF_CKPT_DIR, exist_ok=True)
+    policy.save_pretrained(config.RLAIF_CKPT_DIR)
+    volume.commit()
+    elapsed = time.time() - start
+    print(f"DPO done: {step}/{total_steps} steps in {elapsed:.0f}s -> {config.RLAIF_CKPT_DIR}")
+    return {"steps": step, "total_steps": total_steps, "elapsed": elapsed}
+
+
+@app.local_entrypoint()
+def dpo(epochs: int = config.DPO.epochs, max_seconds: int = config.DPO_MAX_SECONDS):
+    r = dpo_train.remote(epochs, max_seconds)
+    print(f"done: {r}")
+
+
+# ---- Phase 16.5: eval -- DPO perplexity on the SFT set + DPO-vs-SFT win-rate on held-out prompts ----
+@app.function(image=rlaif_eval_image, gpu=config.DPO_GPU, volumes=VOLUMES,
+              secrets=[modal.Secret.from_name(config.OPENAI_SECRET_NAME)], timeout=60 * 20)
+def evaluate_rlaif(batch_size: int = 32) -> dict:
+    import json
+    import math
+    import os
+    import time
+
+    import numpy as np
+    import torch
+    import torch.nn.functional as F
+    from openai import OpenAI
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    device = torch.device("cuda")
+    tok = AutoTokenizer.from_pretrained(config.TOKENIZER_DIR)
+    tok.padding_side = "left"
+    sft = AutoModelForCausalLM.from_pretrained(config.SFT_CKPT_DIR).to(device, torch.bfloat16).eval()
+    dpo_m = AutoModelForCausalLM.from_pretrained(config.RLAIF_CKPT_DIR).to(device, torch.bfloat16).eval()
+
+    # (a) assistant-token perplexity on the SFT set -- identical method to eval_sft_perplexity.
+    with open(config.SFT_INDEX_PATH, encoding="utf-8") as fh:
+        sidx = json.load(fh)
+    ne, seq_len = sidx["num_examples"], config.SEQ_LEN
+    ids = np.memmap(f"{config.SFT_TOKENS_DIR}/input_ids.bin", dtype=np.uint16, mode="r").reshape(ne, seq_len)
+    msk = np.memmap(f"{config.SFT_TOKENS_DIR}/loss_mask.bin", dtype=np.uint8, mode="r").reshape(ne, seq_len)
+
+    def ppl(model) -> tuple:
+        tl = tt = 0.0
+        with torch.no_grad():
+            for b in range(0, ne, batch_size):
+                x = torch.from_numpy(ids[b:b + batch_size].astype(np.int64)).to(device)
+                m = torch.from_numpy(msk[b:b + batch_size].astype(np.float32)).to(device)
+                with torch.autocast("cuda", dtype=torch.bfloat16):
+                    lg = model(input_ids=x).logits[:, :-1, :]
+                lt = F.cross_entropy(lg.reshape(-1, lg.size(-1)).float(),
+                                     x[:, 1:].reshape(-1), reduction="none")
+                tl += (lt * m[:, 1:].reshape(-1)).sum().item()
+                tt += m[:, 1:].sum().item()
+        return tl / tt, math.exp(tl / tt)
+
+    dpo_loss, dpo_ppl = ppl(dpo_m)
+    sft_loss, sft_ppl = ppl(sft)
+    ppl_rise = (dpo_ppl - sft_ppl) / sft_ppl
+
+    # (b) win-rate: one answer each from SFT and DPO on the held-out prompts, judged pairwise.
+    heldout: list[dict] = []
+    with open(config.RLAIF_PROMPTS_PATH, encoding="utf-8") as fh:
+        for line in fh:
+            r = json.loads(line)
+            if r["split"] == "heldout":
+                heldout.append(r)
+    prompts = [r["prompt"] for r in heldout]
+    gk = dict(n=1, temp=config.RLAIF_EVAL_SAMPLE_TEMP, top_p=0.95,
+              max_new_tokens=config.RLAIF_SAMPLE_MAX_NEW_TOKENS)
+    sft_ans = [a[0] for a in _rlaif_generate(sft, tok, prompts, device, **gk)]
+    dpo_ans = [a[0] for a in _rlaif_generate(dpo_m, tok, prompts, device, **gk)]
+
+    client = OpenAI(api_key=os.environ["OPENAI_API_KEY"],
+                    max_retries=config.RLAIF_JUDGE_MAX_RETRIES, timeout=60.0)
+
+    def winner(excerpt, q, a_dpo, a_sft) -> str:
+        def call(A, B) -> str:
+            user = f"Excerpt:\n{excerpt}\n\nQuestion: {q}\n\nAnswer A:\n{A}\n\nAnswer B:\n{B}"
+            resp = client.chat.completions.create(
+                model=config.PREF_JUDGE_MODEL, response_format={"type": "json_object"},
+                messages=[{"role": "system", "content": config.RLAIF_WINRATE_SYSTEM_PROMPT},
+                          {"role": "user", "content": user}])
+            return str(json.loads(resp.choices[0].message.content).get("winner", "tie")).strip().upper()
+        try:
+            w1 = {"A": "dpo", "B": "sft"}.get(call(a_dpo, a_sft), "tie")   # A = dpo
+            time.sleep(config.RLAIF_JUDGE_SLEEP)
+            w2 = {"A": "sft", "B": "dpo"}.get(call(a_sft, a_dpo), "tie")   # A = sft
+            time.sleep(config.RLAIF_JUDGE_SLEEP)
+        except Exception as e:
+            print(f"winrate judge failed: {e}")
+            return "tie"
+        return w1 if w1 == w2 else "tie"
+
+    tally = {"dpo": 0, "sft": 0, "tie": 0}
+    per_dom: dict[str, dict] = {}
+    for r, ad, asf in zip(heldout, dpo_ans, sft_ans):
+        v = winner(r["excerpt"], r["prompt"], ad, asf)
+        tally[v] += 1
+        per_dom.setdefault(r["domain"], {"dpo": 0, "sft": 0, "tie": 0})[v] += 1
+
+    n_h = max(len(heldout), 1)
+    win_rate = (tally["dpo"] + 0.5 * tally["tie"]) / n_h
+    dom_rates = {d: round((v["dpo"] + 0.5 * v["tie"]) / max(sum(v.values()), 1), 3)
+                 for d, v in per_dom.items()}
+    passed = (win_rate >= config.RLAIF_WINRATE_MIN
+              and all(x >= 0.50 for x in dom_rates.values())
+              and ppl_rise <= config.RLAIF_PPL_MAX_RISE)
+
+    result = {
+        "sft_loss": round(sft_loss, 4), "dpo_loss": round(dpo_loss, 4),
+        "sft_perplexity": round(sft_ppl, 3), "dpo_perplexity": round(dpo_ppl, 3),
+        "perplexity_rise": round(ppl_rise, 4), "n_heldout": len(heldout), "tally": tally,
+        "win_rate_vs_sft": round(win_rate, 3), "win_rate_by_domain": dom_rates,
+        "mean_answer_words": {
+            "dpo": round(sum(len(a.split()) for a in dpo_ans) / n_h, 1),
+            "sft": round(sum(len(a.split()) for a in sft_ans) / n_h, 1)},
+        "passed": passed,
+    }
+    os.makedirs(config.RLAIF_DIR, exist_ok=True)
+    with open(config.RLAIF_WINRATE_PATH, "w", encoding="utf-8") as fh:
+        json.dump(result, fh, indent=2)
+    volume.commit()
+    print(json.dumps(result, indent=2))
+    print(f"\nRLAIF eval {'PASSED' if passed else 'DID NOT PASS'}: "
+          f"win_rate={win_rate:.3f} (>= {config.RLAIF_WINRATE_MIN}), "
+          f"ppl {sft_ppl:.2f} -> {dpo_ppl:.2f} ({ppl_rise:+.1%}, cap {config.RLAIF_PPL_MAX_RISE:.0%})")
+    return result
+
+
+@app.local_entrypoint()
+def rlaif_eval(batch_size: int = 32):
+    r = evaluate_rlaif.remote(batch_size)
+    print(f"done: {r}")
+
+
+# ---- Phase 17: push DPO model + tokenizer to HF Hub ----
+@app.function(image=cpu_image, volumes=VOLUMES,
+              secrets=[modal.Secret.from_name(config.HF_SECRET_NAME)], timeout=60 * 15)
+def deploy_rlaif_to_hf(private: bool = True) -> dict:
+    import os
+
+    from huggingface_hub import HfApi
+
+    api = HfApi(token=os.environ["HUGGINGFACE_TOKEN"])
+    api.create_repo(config.HF_REPO_RLAIF, private=private, exist_ok=True)
+    api.upload_folder(repo_id=config.HF_REPO_RLAIF, folder_path=config.RLAIF_CKPT_DIR)
+    api.upload_folder(repo_id=config.HF_REPO_RLAIF, folder_path=config.TOKENIZER_DIR)
+    print(f"pushed to https://huggingface.co/{config.HF_REPO_RLAIF} (private={private})")
+    return {"repo": config.HF_REPO_RLAIF, "private": private}
+
+
+@app.local_entrypoint()
+def deploy_rlaif(private: bool = True):
+    r = deploy_rlaif_to_hf.remote(private)
+    print(f"done: {r}")
+
+
 # ---- Playground inference endpoint: backs the Vercel front end ----
 infer_image = (
     modal.Image.debian_slim(python_version="3.12")
