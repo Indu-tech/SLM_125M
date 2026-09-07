@@ -235,6 +235,85 @@ class RAFTConfig:
 RAFT = RAFTConfig()
 RAFT_GPU = "L4"
 
+# ---- DPO / RLAIF: preference-tune the SFT checkpoint on AI-labelled pairs ----
+# Continues from the SFT checkpoint into its own checkpoint dir; SFT_CKPT_DIR and
+# RAFT_CKPT_DIR are never opened for writing here. DPO branches off SFT in parallel
+# to RAFT: base -> SFT -> {RAFT, DPO}. Whole pipeline is budgeted at <=30 min.
+RLAIF_DIR = f"{DATA_ROOT}/rlaif"
+RLAIF_RAW_DIR = f"{RLAIF_DIR}/raw"
+RLAIF_TOKENS_DIR = f"{RLAIF_DIR}/tokens"
+RLAIF_INDEX_PATH = f"{RLAIF_DIR}/rlaif_index.json"
+RLAIF_PROMPTS_PATH = f"{RLAIF_RAW_DIR}/prompts.jsonl"
+RLAIF_CANDIDATES_PATH = f"{RLAIF_RAW_DIR}/candidates.jsonl"
+RLAIF_PAIRS_TRACKB_PATH = f"{RLAIF_RAW_DIR}/pairs_trackB.jsonl"
+RLAIF_PAIRS_PATH = f"{RLAIF_RAW_DIR}/pairs.jsonl"
+RLAIF_WINRATE_PATH = f"{RLAIF_DIR}/winrate.json"
+RLAIF_CKPT_DIR = f"{CKPT_DIR}/dpo"          # separate from SFT_CKPT_DIR / RAFT_CKPT_DIR
+HF_REPO_RLAIF = "IndraniBera/slm-125m-dpo"  # DPO model push
+
+PREF_JUDGE_MODEL = "gpt-5.4-mini"           # pairwise preference judge (a step up from QA_MODEL)
+RLAIF_HELDOUT_N = 120                       # QA prompts reserved for the win-rate eval
+RLAIF_SAMPLES_PER_PROMPT = 3                # Track-A on-policy SFT samples per training prompt
+RLAIF_SAMPLE_TEMP = 0.8                     # lowered from 1.0: the 125M SFT model goes
+                                           # incoherent at 1.0; 0.8 keeps sample diversity
+                                           # without the hallucination blowup
+RLAIF_SAMPLE_TOP_P = 0.95
+RLAIF_SAMPLE_MAX_NEW_TOKENS = 180
+RLAIF_GEN_BATCH = 64                        # prompts per generate() call; x SAMPLES_PER_PROMPT
+                                           # sequences run concurrently -- 64x3 fits L4 KV cache
+RLAIF_JUDGE_SHARDS = 8                      # Modal containers judging in parallel (.starmap).
+                                           # 8, not 24: org OpenAI limits are 500 RPM / 200K
+                                           # TPM. 8 shards x ~1.7s/call ~= 4.7 calls/s ~=
+                                           # 170K TPM / 280 RPM -- under both, without thrash.
+RLAIF_JUDGE_SLEEP = 0.25                    # small buffer against API-latency variance
+RLAIF_JUDGE_MAX_RETRIES = 6                 # OpenAI SDK exp-backoff retries on 429/5xx
+RLAIF_JUDGE_MIN_CONF = 0.6                  # drop a pair unless both order-swapped calls clear this
+RLAIF_TARGET_PAIRS = 1_076                  # = all Track-B pairs. Track A was dropped: the 125M
+                                           # SFT model's own samples are too weak/loopy for
+                                           # on-policy preference pairs to add usable signal.
+RLAIF_TRACK_B_FRAC = 1.0                    # Track B only (grounded gold answer vs. corruption)
+RLAIF_EVAL_SAMPLE_TEMP = 0.7               # win-rate generation temp (matches the playgrounds)
+RLAIF_WINRATE_MIN = 0.60                    # DPO must win >= this fraction vs SFT overall
+RLAIF_PPL_MAX_RISE = 0.15                   # DPO perplexity may rise at most this much vs SFT
+RLAIF_JUDGE_SYSTEM_PROMPT = (
+    "You compare candidate answers to a question that must be answered ONLY from the "
+    "given excerpt. Prefer the answer that is factually grounded in the excerpt, "
+    "complete, and free of unsupported claims; break ties toward the more concise "
+    'answer. Return strict JSON {"best": "<letter>", "worst": "<letter>", '
+    '"confidence": <0.0-1.0>, "reason": "<short>"}.'
+)
+RLAIF_WINRATE_SYSTEM_PROMPT = (
+    "You judge which of two answers better responds to the question, grounded ONLY in "
+    "the given excerpt: accuracy and grounding first, then completeness, then concision. "
+    'Return strict JSON {"winner": "A" | "B" | "tie", "reason": "<short>"}.'
+)
+
+
+@dataclass(frozen=True)
+class DPOConfig:
+    seq_len: int = SEQ_LEN
+    epochs: int = 4                 # bumped from 2: the gentle 2-epoch run was a no-op
+                                    # (win-rate 0.475, 82/120 ties). Push harder.
+    micro_batch_size: int = 8       # 8 pairs -> 16 seqs/model/step. 16 OOM'd the L4 (fp32
+                                    # (2B,T,vocab) logits + 12-layer activations). 8 + gradient
+                                    # checkpointing (see dpo_train) fits comfortably.
+    beta: float = 0.05            # loosened from 0.1: let the policy move further from SFT
+    lr: float = 1.5e-5           # bumped from 5e-6; still < SFT.lr (5e-5). ppl has huge headroom
+    nll_weight: float = 0.1       # auxiliary SFT loss on the chosen response (keeps 125M fluent)
+    weight_decay: float = 0.0
+    grad_clip: float = 1.0
+    warmup_steps: int = 20
+    ckpt_every_steps: int = 100
+    log_every_steps: int = 10
+    seed: int = 1337
+
+
+DPO = DPOConfig()
+DPO_GPU = "L4"
+DPO_MAX_SECONDS = 900            # cooperative cap on the DPO loop (~270 steps at batch 8
+                                # with gradient checkpointing lands ~7-9 min; headroom)
+DPO_TIMEOUT = 60 * 20           # Modal hard kill on dpo_train
+
 # ---- RAG: BM25 retrieval index served alongside the RAFT checkpoint ----
 RAG_DIR = f"{DATA_ROOT}/rag"
 RAG_CHUNKS_PATH = f"{RAG_DIR}/chunks.jsonl"
@@ -248,6 +327,7 @@ STAGES: tuple[str, ...] = (
     "setup", "clean", "dedup", "tokenizer", "tokenize", "pretrain", "deploy",
     "qa_generate", "sft_tokenize", "sft_train", "raft_prepare", "raft_tokenize",
     "raft_train", "rag_index",
+    "rlaif_prep", "rlaif_judge", "rlaif_tokenize", "rlaif_train", "rlaif_eval",
 )
 
 
